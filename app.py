@@ -1,15 +1,13 @@
-import os, json, re, streamlit as st
+import os
+import streamlit as st
 from dotenv import load_dotenv
 
 from phoenix.otel import register
-from phoenix.trace import suppress_tracing, SpanEvaluations
 from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
-from phoenix.trace.dsl import SpanQuery
+from openinference.instrumentation.langchain import LangChainInstrumentor
 import phoenix as px
 
-from llama_index.llms.openai import OpenAI as llma_OpenAI
-from llama_index.core.tools import FunctionTool
-from llama_index.core.agent import ReActAgent
+from langchain_openai import ChatOpenAI
 
 from src.tools import (
     generate_input_file,
@@ -18,11 +16,11 @@ from src.tools import (
     extract_action,
 )
 from src.prompt_temp import (
-    react_system_prompt as RA_SYSTEM_PROMPT,
     TOOL_CALLING_PROMPT_TEMPLATE,
     TOOL_UNIT_PROMPT_TEMPLATE,
     FINAL_HALLUCINATION_PROMPT_TEMPLATE,
 )
+from src.langgraph_agent import ToolSpec, build_langgraph_agent, build_initial_state
 from phoenix.evals import (
     TOOL_CALLING_PROMPT_RAILS_MAP,
     OpenAIModel,
@@ -43,6 +41,7 @@ def init_observability():
         set_global_tracer_provider=False,
     )
     LlamaIndexInstrumentor().instrument(skip_dep_check=True, tracer_provider=tp)
+    LangChainInstrumentor().instrument(skip_dep_check=True, tracer_provider=tp)
     return px.launch_app()
 
 session = init_observability()
@@ -57,39 +56,33 @@ llm_type_eval_high = st.sidebar.selectbox(
 )
 
 # ---------- tools ---------- #
-abaqus_input_file_tool = FunctionTool.from_defaults(
-    fn=generate_input_file,
-    name="Abaqus_input_file_generator",
-    description="Generates an Abaqus input file with an applied displacement (unit: metres). The applied displacement should not exceed 0.2 metres.",
-)
-abaqus_job_execution_tool = FunctionTool.from_defaults(
-    fn=run_abaqus,
-    name="Abaqus_job_executor",
-    description="Runs an Abaqus job with `cantilever_beam.inp` and collects outputs.",
-)
-
-von_mises_stress_extraction_tool = FunctionTool.from_defaults(
-    fn=extract_von_mises_stress_from_ODB,
-    name="Von_Mises_stress_extractor",
-    description="Extracts max Von-Mises stress from the ODB file (returns MPa).",
-)
-
 tools = [
-    abaqus_input_file_tool,
-    abaqus_job_execution_tool,
-    von_mises_stress_extraction_tool,
+    ToolSpec(
+        name="Abaqus_input_file_generator",
+        description="Generates an Abaqus input file with an applied displacement (unit: metres). The applied displacement should not exceed 0.2 metres.",
+        fn=generate_input_file,
+    ),
+    ToolSpec(
+        name="Abaqus_job_executor",
+        description="Runs an Abaqus job with `cantilever_beam.inp` and collects outputs.",
+        fn=run_abaqus,
+    ),
+    ToolSpec(
+        name="Von_Mises_stress_extractor",
+        description="Extracts max Von-Mises stress from the ODB file (returns MPa).",
+        fn=extract_von_mises_stress_from_ODB,
+    ),
 ]
 
 # ---------- init agent (once) ---------- #
-if "agent" not in st.session_state:
-    llm = llma_OpenAI(model=llm_type)
-    st.session_state.agent = ReActAgent.from_tools(
-        tools, llm=llm, verbose=True, max_iterations=100
-    )
-    with suppress_tracing():
-        st.session_state.agent.update_prompts({"agent_worker:system_prompt": RA_SYSTEM_PROMPT()})
+if "agent_graph" not in st.session_state:
+    llm = ChatOpenAI(model=llm_type)
+    st.session_state.agent_graph = build_langgraph_agent(
+        llm,
+        tools,
+    ).compile()
 
-agent = st.session_state.agent
+agent_graph = st.session_state.agent_graph
 
 # ================== UI ================== #
 st.title("Finite Element Analysis Assistant")
@@ -116,41 +109,49 @@ query = st.text_area("Enter your query:", default_query)
 
 if st.button("Submit"):
     with st.spinner("Processing..."):
-        task = agent.create_task(query)
+        initial_state = build_initial_state(query, tools)
 
         with st.expander("Show Progress"):
             client = px.Client()
-            step_output = agent.run_step(task.task_id)
-            st.markdown(step_output.dict()["output"]["response"])
-            log_stress_eval_real_time(client)
-            while not step_output.is_last:
-                step_output = agent.run_step(task.task_id)
-                st.markdown(step_output.dict()["output"]["response"])
-                log_stress_eval_real_time(client)
+            final_state = None
+            last_response = None
+            for state in agent_graph.stream(
+                initial_state,
+                {"recursion_limit": 100},
+                stream_mode="values",
+            ):
+                final_state = state
+                latest_response = state.get("latest_response")
+                if latest_response and latest_response != last_response:
+                    st.markdown(latest_response)
+                    log_stress_eval_real_time(client)
+                    last_response = latest_response
 
-        final_answer = step_output.dict()["output"]["response"]
+        if not final_state:
+            final_state = initial_state
+
+        final_answer = final_state.get("final_answer") or ""
 
         st.subheader("Final Answer:")
         st.markdown(final_answer)
 
         st.subheader("Intermediate Reasoning and Acting Steps:")
         with st.expander("Show the Steps"):
-            with suppress_tracing():
-                completed = agent.get_completed_tasks()[-1]
-
-            for step in completed.extra_state["current_reasoning"]:
-                for k, v in step.dict().items():
-                    if k not in ("return_direct", "action_input", "is_streaming"):
-                        st.markdown(
-                            f"<span style='color:darkblue;font-weight:bold;'>{k}</span>: {v}",
-                            unsafe_allow_html=True,
-                        )
+            for step in final_state.get("steps", []):
+                for k, v in step.items():
+                    st.markdown(
+                        f"<span style='color:darkblue;font-weight:bold;'>{k}</span>: {v}",
+                        unsafe_allow_html=True,
+                    )
                 st.markdown("----")
 # -------------- evaluation helpers -------------- #
 
 def tool_utilization_eval():
     judge = OpenAIModel(model=llm_type_eval_high, temperature=0)
     rails = list(TOOL_CALLING_PROMPT_RAILS_MAP.values())
+    tool_definitions = [
+        {"name": tool.name, "description": tool.description} for tool in tools
+    ]
     return run_eval(
         span_kind="LLM",
         select=dict(
@@ -171,7 +172,7 @@ def tool_utilization_eval():
                     )(*extract_action(r.output_messages)),
                     axis=1,
                 ),
-                "tool_definitions": [tools] * len(df),
+                "tool_definitions": [tool_definitions] * len(df),
             },
             index=df.index,
         ),
@@ -181,12 +182,7 @@ def tool_utilization_eval():
 def unit_eval():
     judge = OpenAIModel(model=llm_type_eval, temperature=0)
     rails = list(TOOL_CALLING_PROMPT_RAILS_MAP.values())
-    tool_lookup = {
-        (getattr(t.metadata, "name", None) if hasattr(t, "metadata") else getattr(t, "name", None)): (
-            t.metadata.description if hasattr(t, "metadata") else ""
-        )
-        for t in tools
-    }
+    tool_lookup = {tool.name: tool.description for tool in tools}
     return run_eval(
         span_kind="TOOL",
         select=dict(
